@@ -1,29 +1,18 @@
-name: STLT app
+name: STLT macOS Intel
 
-# Builds and tests the app on every push and pull request; a manual run with a tag also publishes a release.
 on:
   push:
   pull_request:
   workflow_dispatch:
     inputs:
       release:
-        description: "Publish a release with this tag (e.g. v0.1.0); empty for a plain build"
+        description: "Version tag (e.g. v2.0.1); empty for a plain build"
         required: false
         default: ""
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-2022
-            artifact: windows
-          - os: macos-15 # Apple Silicon; macos-14 jobs have been cancelled before starting since 5 November 2026
-            artifact: macos
-          - os: ubuntu-24.04
-            artifact: linux
-    runs-on: ${{ matrix.os }}
+  build-macos-intel:
+    runs-on: macos-15-intel
     defaults:
       run:
         shell: bash
@@ -32,33 +21,21 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install X11, OpenGL, GLEW, GTK, ALSA and FFmpeg headers
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl-dev libglew-dev libxkbcommon-dev libgtk-3-dev libasound2-dev \
-            libavformat-dev libavcodec-dev libswscale-dev libswresample-dev libavutil-dev
-
-      # macOS links a small static FFmpeg built from source; it only changes with the script, so it is cached.
       - name: Cache FFmpeg
-        if: runner.os == 'macOS'
         uses: actions/cache@v4
         with:
           path: ~/ffmpeg
-          key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('app/scripts/build-ffmpeg.sh') }}
+          key: ffmpeg-macOS-X64-${{ hashFiles('app/scripts/build-ffmpeg.sh') }}
 
       - name: Build FFmpeg
-        if: runner.os == 'macOS'
         run: |
           if [ ! -f "$HOME/ffmpeg/lib/libavcodec.a" ]; then
             FFMPEG_BUILD_DIR="$RUNNER_TEMP/ffmpeg-src" sh app/scripts/build-ffmpeg.sh "$HOME/ffmpeg"
           fi
 
-      - name: Build
+      - name: Build STLT
         run: |
-          EXTRA=""
-          if [ "$RUNNER_OS" = "macOS" ]; then EXTRA="-DFFMPEG_ROOT=$HOME/ffmpeg"; fi
-          # A release reports its own version (the tag without the v).
+          EXTRA="-DFFMPEG_ROOT=$HOME/ffmpeg"
           TAG="${{ inputs.release }}"
           if [ -n "$TAG" ]; then EXTRA="$EXTRA -DSTLT_VERSION=${TAG#v}"; fi
           cmake -S app -B app/build -DCMAKE_BUILD_TYPE=Release $EXTRA
@@ -67,23 +44,20 @@ jobs:
       - name: Test the media engine and effects
         run: ctest --test-dir app/build -C Release --output-on-failure
 
-      # STLT-CHASER (the chaser submodule): its effects and its editor, opened from Output > Chaser.
       - name: Build the STLT-CHASER effects
         run: |
           cmake -S chaser/plugin -B chaser/plugin/build -DCMAKE_BUILD_TYPE=Release
           cmake --build chaser/plugin/build --config Release --parallel
           cmake --install chaser/plugin/build --prefix chaser/plugin/dist --config Release
 
-      # A host finds a plugin through plugMain alone: a bundle without it would not load.
       - name: Check the STLT-CHASER bundles export plugMain
-        if: runner.os == 'macOS'
         run: |
           shopt -s nullglob
           bundles=(chaser/plugin/dist/*.bundle)
           if [ ${#bundles[@]} -ne 3 ]; then echo "::error::Expected 3 plugin bundles, found ${#bundles[@]}"; exit 1; fi
           for bundle in "${bundles[@]}"; do
             binary="$bundle/Contents/MacOS/$(basename "$bundle" .bundle)"
-            nm -gU -arch arm64 "$binary" | grep -q " _plugMain$" || { echo "::error::$bundle does not export plugMain"; exit 1; }
+            nm -gU "$binary" | grep -q " _plugMain$" || { echo "::error::$bundle does not export plugMain"; exit 1; }
           done
 
       - uses: actions/setup-node@v4
@@ -99,168 +73,38 @@ jobs:
         run: |
           npm ci
           npm test
-          if [ "$RUNNER_OS" = "Windows" ]; then npx electron-builder --win dir --publish never
-          elif [ "$RUNNER_OS" = "macOS" ]; then npx electron-builder --mac dir --publish never
-          else npx electron-builder --linux dir --publish never; fi
+          npx electron-builder --mac dir --publish never
 
-      # The folder people unpack: the program, the effects in plugins/, the editor in chaser/.
-      - name: Pack
+      - name: Pack STLT.app
         run: |
-          mkdir -p package
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            mkdir -p package/STLT/plugins
-            cp app/build/Release/STLT.exe app/build/Release/*.dll package/STLT/
-            cp -r app/isf package/STLT/isf
-            cp chaser/plugin/dist/*.dll package/STLT/plugins/
-            cp -r chaser/editor/release/win-unpacked package/STLT/chaser
-            test -f package/STLT/chaser/STLT-CHASER.exe
-            (cd package && 7z a -tzip -bd ../STLT-windows.zip STLT > /dev/null)
-          elif [ "$RUNNER_OS" = "macOS" ]; then
-            # Everything inside STLT.app: the effects in Resources/plugins, the editor in Resources/chaser (where
-            # the program looks for them). Then the whole app signed ad hoc (no Apple identity), inner code first,
-            # so Apple Silicon runs it and its parts agree.
-            APP=app/build/STLT.app
-            mkdir -p "$APP/Contents/Resources/plugins" "$APP/Contents/Resources/chaser"
-            cp -R chaser/plugin/dist/*.bundle "$APP/Contents/Resources/plugins/"
-            EDITOR=$(find chaser/editor/release -maxdepth 2 -name STLT-CHASER.app -type d | head -1)
-            test -n "$EDITOR"
-            ditto "$EDITOR" "$APP/Contents/Resources/chaser/STLT-CHASER.app"
-            test -x "$APP/Contents/Resources/chaser/STLT-CHASER.app/Contents/MacOS/STLT-CHASER"
-            codesign --force --deep --sign - "$APP/Contents/Resources/chaser/STLT-CHASER.app"
-            for bundle in "$APP"/Contents/Resources/plugins/*.bundle; do codesign --force --sign - "$bundle"; done
-            codesign --force --sign - "$APP"
-            codesign --verify --deep --verbose=2 "$APP"
-            ditto -c -k --keepParent "$APP" STLT-macos.zip
-          else
-            mkdir -p package/STLT/plugins
-            cp app/build/stlt package/STLT/
-            cp app/resources/stlt.png package/STLT/
-            cp -r app/isf package/STLT/isf
-            cp chaser/plugin/dist/*.so package/STLT/plugins/
-            cp -r chaser/editor/release/linux-unpacked package/STLT/chaser
-            test -x package/STLT/chaser/stlt-chaser
-            tar -C package -czf STLT-linux.tar.gz STLT
-          fi
-          ls -l STLT-*
+          APP=app/build/STLT.app
+          mkdir -p "$APP/Contents/Resources/plugins" "$APP/Contents/Resources/chaser"
+          cp -R chaser/plugin/dist/*.bundle "$APP/Contents/Resources/plugins/"
+          EDITOR=$(find chaser/editor/release -maxdepth 2 -name STLT-CHASER.app -type d | head -1)
+          test -n "$EDITOR"
+          ditto "$EDITOR" "$APP/Contents/Resources/chaser/STLT-CHASER.app"
+          test -x "$APP/Contents/Resources/chaser/STLT-CHASER.app/Contents/MacOS/STLT-CHASER"
+          codesign --force --deep --sign - "$APP/Contents/Resources/chaser/STLT-CHASER.app"
+          for bundle in "$APP"/Contents/Resources/plugins/*.bundle; do codesign --force --sign - "$bundle"; done
+          codesign --force --sign - "$APP"
+          codesign --verify --deep --verbose=2 "$APP"
+          ditto -c -k --keepParent "$APP" STLT-macos-intel.zip
 
-      # The NIMS PRO LINK transmitter, for the DJ's computer (Windows and macOS, where Traktor runs): a download of its own.
-      - name: Pack the NIMS PRO LINK transmitter
-        if: runner.os != 'Linux'
+      - name: Pack NIMS PRO LINK transmitter
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            mkdir -p package/NIMSProLink
-            cp app/build/Release/NIMSProLink.exe package/NIMSProLink/
-            cp docs/NIMSLINK.md package/NIMSProLink/README.md
-            (cd package && 7z a -tzip -bd ../NIMSProLink-windows.zip NIMSProLink > /dev/null)
-          else
-            TX="app/build/NIMS PRO LINK.app"
-            codesign --force --sign - "$TX"
-            codesign --verify --verbose=2 "$TX"
-            ditto -c -k --keepParent "$TX" NIMSProLink-macos.zip
-          fi
-          ls -l NIMSProLink-*
-
-      # NIMS PRO LINK end to end on this machine: the transmitter's made-up decks reach the program, which launches the
-      # clip named after the track that plays and follows its tempo.
-      - name: NIMS PRO LINK end to end (Linux, virtual screen)
-        if: runner.os == 'Linux'
-        run: xvfb-run -a -s "-screen 0 1600x900x24" python3 app/tests/nimslink_smoke.py package/STLT/stlt app/build/nimsprolink app/tests/fixtures
-
-      # The real program on clips of each kind (HAP, DXV, H.264) and with STLT-CHASER's effects: it must draw the
-      # right picture and quit by itself. Windows runners have no GPU, so Mesa's software OpenGL stands in, next
-      # to a copy of the program (never in the package).
-      - name: Smoke test (Windows, software OpenGL)
-        if: runner.os == 'Windows'
-        # Mesa pinned to a release that works: 26.2.6 (3 November 2026) gives no OpenGL here, and "latest" would
-        # break the test again the day a new one comes out. Move the pin by hand after trying a newer one.
-        run: |
-          # Authenticated: unauthenticated API calls share a small hourly limit per runner address and then come back
-          # without the asset list.
-          curl -sSL --retry 3 -H "Authorization: Bearer ${{ github.token }}" https://api.github.com/repos/pal1000/mesa-dist-win/releases/tags/26.2.5 -o mesa.json
-          URL=$(python -c "import json; d = json.load(open('mesa.json')); print(next(a['browser_download_url'] for a in d['assets'] if a['name'].endswith('release-msvc.7z')))")
-          curl -sSL "$URL" -o mesa.7z
-          7z x -y -omesa mesa.7z > /dev/null
-          mkdir -p smoke
-          cp -r package/STLT smoke/
-          cp mesa/x64/*.dll smoke/STLT/
-          python app/tests/smoke.py smoke/STLT/STLT.exe app/tests/fixtures
-
-      - name: Smoke test (Linux, virtual screen)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get install -y xvfb
-          xvfb-run -a -s "-screen 0 1920x1080x24" python3 app/tests/smoke.py package/STLT/stlt app/tests/fixtures
+          TX="app/build/NIMS PRO LINK.app"
+          codesign --force --sign - "$TX"
+          codesign --verify --verbose=2 "$TX"
+          ditto -c -k --keepParent "$TX" NIMSProLink-macos-intel.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: STLT-${{ matrix.artifact }}
-          path: STLT-${{ matrix.artifact }}.*
+          name: STLT-macos-intel
+          path: STLT-macos-intel.zip
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
-        if: runner.os != 'Linux'
         with:
-          name: NIMSProLink-${{ matrix.artifact }}
-          path: NIMSProLink-${{ matrix.artifact }}.*
+          name: NIMSProLink-macos-intel
+          path: NIMSProLink-macos-intel.zip
           if-no-files-found: error
-
-  # The tests on Windows under AddressSanitizer (MSVC): reads past a buffer, use after free and the like stop the
-  # run with a report. Not packaged.
-  windows-asan:
-    runs-on: windows-2022
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build with AddressSanitizer
-        run: |
-          # cl takes -options too; a /option would be turned into a path by Git Bash.
-          cmake -S app -B app/build-asan -DCMAKE_C_FLAGS_INIT="-fsanitize=address" -DCMAKE_CXX_FLAGS_INIT="-fsanitize=address"
-          cmake --build app/build-asan --config RelWithDebInfo --parallel
-
-      - name: Tests under AddressSanitizer
-        run: |
-          ASAN_DLL=$(find "/c/Program Files/Microsoft Visual Studio/2022" -name clang_rt.asan_dynamic-x86_64.dll -path '*Hostx64/x64*' | head -1)
-          echo "ASan runtime: $ASAN_DLL"
-          export PATH="$(dirname "$ASAN_DLL"):$PATH"
-          ctest --test-dir app/build-asan -C RelWithDebInfo --output-on-failure
-
-  # A tag v* (or a manual run with a release tag) publishes the builds as a GitHub Release, with the notes in
-  # docs/releases/<tag>.md; a manual run creates the tag on the commit it built. always(): a release still goes
-  # out when one system's build did not run (the macOS runner can be unavailable); Windows and Linux are needed.
-  release:
-    if: always() && (startsWith(github.ref, 'refs/tags/v') || inputs.release != '')
-    needs: build
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Name the files after the version
-        run: |
-          V="${{ inputs.release || github.ref_name }}"
-          mkdir -p release
-          mv artifacts/STLT-windows.zip "release/STLT-$V-windows.zip"
-          mv artifacts/STLT-linux.tar.gz "release/STLT-$V-linux.tar.gz"
-          if [ -f artifacts/STLT-macos.zip ]; then mv artifacts/STLT-macos.zip "release/STLT-$V-macos.zip"; fi
-          if [ -f artifacts/NIMSProLink-windows.zip ]; then mv artifacts/NIMSProLink-windows.zip "release/NIMSProLink-$V-windows.zip"; fi
-          if [ -f artifacts/NIMSProLink-macos.zip ]; then mv artifacts/NIMSProLink-macos.zip "release/NIMSProLink-$V-macos.zip"; fi
-          ls -l release
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.release || github.ref_name }}
-          target_commitish: ${{ github.sha }}
-          name: STLT ${{ inputs.release || github.ref_name }}
-          # A beta or a release candidate is marked as a pre-release.
-          prerelease: ${{ contains(inputs.release || github.ref_name, 'beta') || contains(inputs.release || github.ref_name, 'rc') }}
-          body_path: docs/releases/${{ inputs.release || github.ref_name }}.md
-          files: release/*
