@@ -26,7 +26,9 @@ jobs:
         with:
           path: ~/ffmpeg
           key: ffmpeg-macOS-X64-${{ hashFiles('app/scripts/build-ffmpeg.sh') }}
-
+      - name: Install NASM
+        run: brew install nasm
+        
       - name: Build FFmpeg
         run: |
           if [ ! -f "$HOME/ffmpeg/lib/libavcodec.a" ]; then
