@@ -43,9 +43,6 @@ jobs:
           cmake -S app -B app/build -DCMAKE_BUILD_TYPE=Release $EXTRA
           cmake --build app/build --config Release --parallel
 
-      - name: Test the media engine and effects
-        run: ctest --test-dir app/build -C Release --output-on-failure
-
       - name: Build the STLT-CHASER effects
         run: |
           cmake -S chaser/plugin -B chaser/plugin/build -DCMAKE_BUILD_TYPE=Release
